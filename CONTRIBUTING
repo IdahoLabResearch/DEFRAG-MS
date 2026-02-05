@@ -1,0 +1,41 @@
+Copyright 2026, Battelle Energy Alliance, LLC, ALL RIGHTS RESERVED
+---
+
+## ✅ `CONTRIBUTING.md` (Optional)
+
+```markdown
+# Contributing to Mass Spec Transient Analysis Toolkit
+
+Thank you for your interest in contributing!
+
+This repository is intended to support researchers working with transient mass spectrometry data, particularly from TAP experiments. Contributions are welcome, especially in the form of:
+
+- New analysis scripts
+- Improvements to preprocessing
+- Bug fixes
+- Documentation enhancements
+
+## 🛠 How to Contribute
+
+1. **Fork the repository**
+2. **Create a new branch** for your feature or fix
+3. **Commit your changes** with clear messages
+4. **Submit a pull request** with a description of what you changed and why
+
+## 📦 Code Style
+
+- Use Python 3.8+ syntax
+- Follow PEP8 where possible
+- Include comments and docstrings for clarity
+
+## 🧪 Testing
+
+If you add new functionality, please test it using the example data in `data/`. Automated tests are not required but are appreciated.
+
+## 📄 Licensing
+
+By contributing, you agree that your contributions will be licensed under the MIT License.
+
+---
+
+Thanks again for helping improve this toolkit!
