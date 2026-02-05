@@ -1,0 +1,243 @@
+# -*- coding: utf-8 -*-
+"""
+Mass Spec Processing Script with Configurable Double Background Subtraction
+Created on Nov 5, 2025
+@author: kristy-sci
+Copyright 2026, Battelle Energy Alliance, LLC. All Rights Reserved.
+"""
+
+import os
+import argparse
+import pandas as pd
+import numpy as np
+from scipy.optimize import nnls
+from scipy import integrate
+import matplotlib.pyplot as plt
+import csv
+
+# --- User Configuration ---
+V = 20  # Pulses per AMU
+NUM_AMUS = 10  # Number of AMUs in the dataset
+SHEET_START = 3
+SHEET_END = 13
+
+AMU_MAP = {
+    0: "2", 1: "15", 2: "18", 3: "26", 4: "28",
+    5: "29", 6: "30", 7: "40", 8: "41", 9: "44"
+}
+
+# --- Utility Functions ---
+def load_excel_data(file_path):
+    dfs = [pd.read_excel(file_path, sheet_name=i) for i in range(SHEET_START, SHEET_END)]
+    df = pd.concat(dfs, axis=1)
+    df['Time (s)'] = df['Time (s)'].shift(1)
+    df = df.drop(df.columns[[0, 1]], axis=1).dropna(how='all', axis=1).drop(index=[0, 6100], errors='ignore')
+    return df
+
+def rename_duplicate_columns(df):
+    cols = pd.Series(df.columns)
+    for dup in df.columns[df.columns.duplicated(keep=False)]:
+        cols[df.columns.get_loc(dup)] = [dup + '.' + str(d_idx) if d_idx != 0 else dup for d_idx in range(df.columns.get_loc(dup).sum())]
+    df.columns = cols
+    return df
+
+def apply_gain_correction(df, gc):
+    dfg = []
+    for x in range(NUM_AMUS):
+        b = x * (V + 1)
+        dfgc = [pd.DataFrame(df.iloc[:, (i + b)]) for i in range(1, V + 1)]
+        dfgc = pd.concat(dfgc, axis=1).mul(np.full((1, V), gc[x]))
+        dfg.append(dfgc)
+    dfg = pd.concat(dfg, axis=1)
+    dfg.insert(0, 'time', df['Time (s)'].values[:])
+    return dfg
+
+def subtract_pre_background(df, bkg_ranges, mode):
+    label_to_idx = {v: k for k, v in AMU_MAP.items()}
+    bkg_values = {}
+
+    for gas_label, (start, end) in bkg_ranges.items():
+        amu_idx = label_to_idx[gas_label]
+        if mode == "average":
+            pulse_indices = [0]  # Only first pulse used in average mode
+        else:
+            pulse_indices = range(V)  # All 20 pulses in individual mode
+
+        for pulse_idx in pulse_indices:
+            col_idx = amu_idx * V + pulse_idx
+            bkg_values[col_idx] = df.iloc[start:end, col_idx + 1].mean()
+
+    dftt = []
+    for i in range(df.shape[1] - 1):
+        col = df.iloc[:, i + 1]
+        if i in bkg_values:
+            col = col - bkg_values[i]
+        dftt.append(pd.DataFrame(col))
+
+    df = pd.concat([df['time'], pd.concat(dftt, axis=1)], axis=1).dropna(how='all', axis=1).iloc[102:]
+    return df
+
+
+
+def defragment(df, A):
+    df_bbb = []
+    for x in range(1, V + 1):
+        df_bb = [pd.DataFrame(df[df.columns[x + i * V]]) for i in range(NUM_AMUS)]
+        df_bbb.append(pd.concat(df_bb, axis=1))
+    b = np.transpose(np.squeeze(np.asarray(pd.concat(df_bbb, axis=1))))
+    df_xx = []
+    for i in range(b.shape[1]):
+        xa = [pd.DataFrame(nnls(A, b[range(NUM_AMUS * n, NUM_AMUS + NUM_AMUS * n), i])[0]) for n in range(V)]
+        df_xx.append(pd.concat(xa, axis=1))
+    return pd.concat(df_xx, axis=1)
+
+def average_or_individual(df_xx, mode):
+    df_x1 = pd.concat([pd.DataFrame(df_xx.iloc[:, i::V].T) for i in range(V)], axis=1)
+    if mode == 'average':
+        df_averaged = pd.DataFrame()
+        for i in range(NUM_AMUS):
+            cols = df_x1.iloc[:, i::NUM_AMUS]
+            label = AMU_MAP.get(i, f"AMU{i}")
+            df_averaged[label] = cols.mean(axis=1)
+        return df_averaged, df_x1  # Return raw matrix for std later
+    else:
+        df_x1.columns = [f"{AMU_MAP.get(i % NUM_AMUS, f'AMU{i % NUM_AMUS}')}.{i // NUM_AMUS}" for i in range(df_x1.shape[1])]
+        return df_x1, None
+
+
+def subtract_post_background(df, post_bkg_ranges, mode):
+    for gas_label, (start, end) in post_bkg_ranges.items():
+        if mode == "average":
+            if gas_label in df.columns:
+                bkg_val = df[gas_label].iloc[start:end].mean()
+                df[gas_label] -= bkg_val
+        else:
+            matching_cols = [col for col in df.columns if col.startswith(gas_label)]
+            for col in matching_cols:
+                bkg_val = df[col].iloc[start:end].mean()
+                df[col] -= bkg_val
+    df[df < 0] = 0
+    return df
+
+
+def integrate_flux(df, time_col='time'):
+    return {col: integrate.simps(df[col], df[time_col]) for col in df.columns if col != time_col}
+
+def integrate_flux_with_std(df_matrix, time_vector):
+    flux_means = {}
+    flux_stds = {}
+    for i in range(NUM_AMUS):
+        label = AMU_MAP.get(i, f"AMU{i}")
+        cols = df_matrix.iloc[:, i::NUM_AMUS]
+        integrals = cols.apply(lambda col: integrate.simps(col, time_vector), axis=0)
+        flux_means[label] = integrals.mean()
+        flux_stds[f"{label}_std"] = integrals.std()
+    return flux_means, flux_stds
+
+def plot_flux(df, time_col='time'):
+    for col in df.columns:
+        if col != time_col:
+            plt.plot(df[time_col], df[col], label=f'AMU {col}')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Signal [V]')
+    plt.tight_layout()
+    # plt.legend()
+    plt.show()
+
+# --- Main Processing ---
+def process_file(file_path, args, gc, A):
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    df = load_excel_data(file_path)
+    df = rename_duplicate_columns(df)
+    df = apply_gain_correction(df, gc)
+
+    if args.bkg:
+        pre_bkg_ranges = {
+            "28": (5800, 5900),
+            "40": (5800, 5900),
+            "29": (5800, 5900),
+        }
+        df = subtract_pre_background(df, pre_bkg_ranges, args.mode)
+    else:
+        df = df.iloc[102:]
+
+
+    df_xx = defragment(df, A)
+    df_out, df_matrix = average_or_individual(df_xx, args.mode)
+    df_out['time'] = df['time'].values[:]
+
+    if args.bkg:
+        post_bkg_ranges = {
+            # "2": (0, 55),
+            "15": (5800, 5900),
+            "26": (5800, 5900),
+            "28": (5800, 5900),
+            "29": (5800, 5900),
+            "30": (5800, 5900),
+            "40": (5800, 5900),
+            "41": (5800, 5900),
+            "44": (5800, 5900),
+        }
+        df_out = subtract_post_background(df_out, post_bkg_ranges, args.mode)
+
+    df_out[df_out < 0] = 0
+    df_out.to_csv(f"flux_{base_name}.csv", index=False)
+
+    if args.integrate:
+        if args.mode == "average":
+            fluxes, flux_stds = integrate_flux_with_std(df_matrix, df['time'].values[:])
+            pd.DataFrame([fluxes]).to_csv(f"IM_{base_name}.csv", index=False)
+            pd.DataFrame([flux_stds]).to_csv(f"IM_std_{base_name}.csv", index=False)
+        else:
+            fluxes = integrate_flux(df_out)
+            pd.DataFrame([fluxes]).to_csv(f"IM_{base_name}.csv", index=False)
+
+    if args.plot:
+        plot_flux(df_out)
+
+# --- Entry Point for CLI ---
+def main():
+    parser = argparse.ArgumentParser(description="Mass Spec Preprocessing Tool")
+    parser.add_argument("input", help="Input file or directory")
+    parser.add_argument("--mode", choices=["average", "individual"], default="average", help="Averaging mode")
+    parser.add_argument("--bkg", action="store_true", help="Enable double background subtraction")
+    parser.add_argument("--plot", action="store_true", help="Plot the fluxes")
+    parser.add_argument("--integrate", action="store_true", help="Integrate the fluxes")
+    args = parser.parse_args()
+
+    gc = np.array(pd.read_csv("gc.csv"))
+    with open("defrag_key.csv", newline='') as csvfile:
+        A = np.transpose(np.squeeze(np.asarray(np.array(list(csv.reader(csvfile))).astype(float))))
+
+    if os.path.isdir(args.input):
+        files = [os.path.join(args.input, f) for f in os.listdir(args.input) if f.endswith(".xlsx")]
+    else:
+        files = [args.input]
+
+    for file_path in files:
+        process_file(file_path, args, gc, A)
+
+# --- Spyder-Friendly Manual Run ---
+if __name__ == "__main__":
+    class Args:
+        input = ['knud1.xlsx','knud2.xlsx',"knud10.xlsx"]
+        mode = "average"
+        bkg = True
+        plot = True
+        integrate = True
+
+    args = Args()
+
+    gc = np.array(pd.read_csv("gc.csv"))
+    with open("defrag_key.csv", newline='') as csvfile:
+        A = np.transpose(np.squeeze(np.asarray(np.array(list(csv.reader(csvfile))).astype(float))))
+
+    if isinstance(args.input, list):
+        files = args.input
+    elif os.path.isdir(args.input):
+        files = [os.path.join(args.input, f) for f in os.listdir(args.input) if f.endswith(".xlsx")]
+    else:
+        files = [args.input]
+
+    for file_path in files:
+        process_file(file_path, args, gc, A)
